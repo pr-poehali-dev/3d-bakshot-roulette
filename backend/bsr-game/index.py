@@ -37,8 +37,29 @@ def bot_action(game_state: dict, bot_slot: int) -> str:
         return 'shoot_self'
     return 'shoot_other'
 
+def get_players_list(cur, game_id):
+    cur.execute("""
+        SELECT gp.slot, gp.is_bot, gp.bot_name, gp.hp, gp.max_hp, gp.coins, gp.items, gp.alive, gp.is_winner,
+               u.username, u.id as user_id
+        FROM bsr_game_players gp
+        LEFT JOIN bsr_users u ON u.id = gp.user_id
+        WHERE gp.game_id = %s ORDER BY gp.slot
+    """, (game_id,))
+    players = []
+    for p in cur.fetchall():
+        slot, is_bot, bot_name, hp, max_hp, pc, items, alive, is_winner, uname, uid = p
+        players.append({
+            'slot': slot, 'is_bot': is_bot,
+            'name': bot_name if is_bot else uname,
+            'hp': hp, 'max_hp': max_hp, 'coins': pc,
+            'items': items if isinstance(items, list) else json.loads(items or '[]'),
+            'alive': alive, 'is_winner': is_winner,
+            'user_id': uid
+        })
+    return players
+
 def handler(event: dict, context) -> dict:
-    """Игровая логика Buckshot Roulette: создание комнат, ходы, состояние игры"""
+    """Игровая логика Buckshot Roulette: создание комнат, лобби, ходы, состояние игры"""
     headers = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -57,7 +78,7 @@ def handler(event: dict, context) -> dict:
 
     try:
         user_row = get_user_from_session(cur, session_id)
-        if not user_row and action not in ['state']:
+        if not user_row and action not in ['state', 'lobby']:
             return {'statusCode': 401, 'headers': headers, 'body': json.dumps({'error': 'Не авторизован'})}
 
         if user_row:
@@ -107,68 +128,89 @@ def handler(event: dict, context) -> dict:
             db.commit()
             return {'statusCode': 200, 'headers': headers, 'body': json.dumps({
                 'ok': True, 'game_id': game_id, 'room_code': room_code,
-                'shells': len(shells), 'live': live, 'blank': blank
+                'shells': len(shells), 'live': live, 'blank': blank,
+                'is_host': True, 'status': 'playing' if (mode == 'solo' or bot_count > 0) else 'waiting'
             })}
 
         elif action == 'join':
-            room_code = body.get('room_code', '').upper()
-            cur.execute("SELECT id, status, max_players FROM bsr_games WHERE room_code = %s", (room_code,))
+            room_code = body.get('room_code', '').upper().strip()
+            cur.execute("SELECT id, status, max_players, created_by FROM bsr_games WHERE room_code = %s", (room_code,))
             game_row = cur.fetchone()
             if not game_row:
                 return {'statusCode': 404, 'headers': headers, 'body': json.dumps({'error': 'Комната не найдена'})}
-            game_id, status, max_players = game_row
-            if status != 'waiting':
-                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Игра уже началась'})}
+            game_id, status, max_players, created_by = game_row
+            if status == 'finished':
+                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Игра уже завершена'})}
 
             cur.execute("SELECT COUNT(*) FROM bsr_game_players WHERE game_id = %s", (game_id,))
             player_count = cur.fetchone()[0]
-            if player_count >= max_players:
-                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Комната заполнена'})}
 
             cur.execute("SELECT id FROM bsr_game_players WHERE game_id = %s AND user_id = %s", (game_id, user_id))
-            if cur.fetchone():
-                pass
-            else:
+            already_in = cur.fetchone()
+
+            if not already_in:
+                if status == 'playing':
+                    return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Игра уже началась'})}
+                if player_count >= max_players:
+                    return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Комната заполнена'})}
                 cur.execute("""
                     INSERT INTO bsr_game_players (game_id, user_id, slot, hp, max_hp, coins)
                     VALUES (%s, %s, %s, 2, 2, 10)
                 """, (game_id, user_id, player_count))
+                db.commit()
 
+            is_host = (created_by == user_id)
+            return {'statusCode': 200, 'headers': headers, 'body': json.dumps({
+                'ok': True, 'game_id': game_id, 'room_code': room_code,
+                'is_host': is_host, 'status': status
+            })}
+
+        elif action == 'lobby':
+            game_id = int(body.get('game_id', 0))
+            cur.execute("SELECT id, room_code, status, mode, max_players, created_by FROM bsr_games WHERE id = %s", (game_id,))
+            game_row = cur.fetchone()
+            if not game_row:
+                return {'statusCode': 404, 'headers': headers, 'body': json.dumps({'error': 'Игра не найдена'})}
+            g_id, room_code, status, mode, max_players, created_by = game_row
+            players = get_players_list(cur, game_id)
+            is_host = user_row and (created_by == user_row[0])
+            return {'statusCode': 200, 'headers': headers, 'body': json.dumps({
+                'ok': True, 'game_id': g_id, 'room_code': room_code,
+                'status': status, 'mode': mode, 'max_players': max_players,
+                'players': players, 'is_host': is_host,
+                'player_count': len(players)
+            })}
+
+        elif action == 'start':
+            game_id = int(body.get('game_id', 0))
+            cur.execute("SELECT id, status, created_by, max_players FROM bsr_games WHERE id = %s", (game_id,))
+            game_row = cur.fetchone()
+            if not game_row:
+                return {'statusCode': 404, 'headers': headers, 'body': json.dumps({'error': 'Игра не найдена'})}
+            g_id, status, created_by, max_players = game_row
+            if created_by != user_id:
+                return {'statusCode': 403, 'headers': headers, 'body': json.dumps({'error': 'Только хост может запустить игру'})}
+            if status != 'waiting':
+                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Игра уже запущена или завершена'})}
             cur.execute("SELECT COUNT(*) FROM bsr_game_players WHERE game_id = %s", (game_id,))
-            new_count = cur.fetchone()[0]
-            if new_count >= max_players:
-                cur.execute("UPDATE bsr_games SET status = 'playing' WHERE id = %s", (game_id,))
-
+            cnt = cur.fetchone()[0]
+            if cnt < 2:
+                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Нужно минимум 2 игрока'})}
+            cur.execute("UPDATE bsr_games SET status = 'playing' WHERE id = %s", (game_id,))
             db.commit()
             return {'statusCode': 200, 'headers': headers, 'body': json.dumps({'ok': True, 'game_id': game_id})}
 
         elif action == 'state':
             game_id = int(body.get('game_id', 0))
-            cur.execute("SELECT id, room_code, status, mode, max_players, current_turn, round, game_state FROM bsr_games WHERE id = %s", (game_id,))
+            cur.execute("SELECT id, room_code, status, mode, max_players, current_turn, round, game_state, created_by FROM bsr_games WHERE id = %s", (game_id,))
             game_row = cur.fetchone()
             if not game_row:
                 return {'statusCode': 404, 'headers': headers, 'body': json.dumps({'error': 'Игра не найдена'})}
 
-            g_id, room_code, status, mode, max_players, current_turn, rnd, gs = game_row
+            g_id, room_code, status, mode, max_players, current_turn, rnd, gs, created_by = game_row
             game_state = gs if isinstance(gs, dict) else json.loads(gs)
-
-            cur.execute("""
-                SELECT gp.slot, gp.is_bot, gp.bot_name, gp.hp, gp.max_hp, gp.coins, gp.items, gp.alive, gp.is_winner,
-                       u.username
-                FROM bsr_game_players gp
-                LEFT JOIN bsr_users u ON u.id = gp.user_id
-                WHERE gp.game_id = %s ORDER BY gp.slot
-            """, (game_id,))
-            players = []
-            for p in cur.fetchall():
-                slot, is_bot, bot_name, hp, max_hp, pc, items, alive, is_winner, uname = p
-                players.append({
-                    'slot': slot, 'is_bot': is_bot,
-                    'name': bot_name if is_bot else uname,
-                    'hp': hp, 'max_hp': max_hp, 'coins': pc,
-                    'items': items if isinstance(items, list) else json.loads(items or '[]'),
-                    'alive': alive, 'is_winner': is_winner
-                })
+            players = get_players_list(cur, game_id)
+            is_host = user_row and (created_by == user_row[0])
 
             shells_hidden = ['?'] * len(game_state.get('shells', []))
             return {'statusCode': 200, 'headers': headers, 'body': json.dumps({
@@ -179,7 +221,8 @@ def handler(event: dict, context) -> dict:
                     'current_turn': current_turn, 'round': rnd,
                     'shells_remaining': len(game_state.get('shells', [])),
                     'last_shot': game_state.get('last_shot'),
-                    'log': game_state.get('last_action_log', [])
+                    'log': game_state.get('last_action_log', []),
+                    'is_host': is_host
                 },
                 'players': players,
                 'shells_hint': shells_hidden
@@ -196,7 +239,7 @@ def handler(event: dict, context) -> dict:
 
             g_id, status, current_turn, rnd, gs, max_players = game_row
             if status != 'playing':
-                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Игра не идёт'})}
+                return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'error': 'Игра не активна'})}
 
             game_state = gs if isinstance(gs, dict) else json.loads(gs)
 
@@ -234,7 +277,8 @@ def handler(event: dict, context) -> dict:
             game_state['shells'] = shells
             game_state['last_shot'] = shell
 
-            log_entry = f"[R{rnd}] {shooter[3] and 'BOT' or 'PLAYER'} -> {'SELF' if target == 'self' else 'OTHER'}: {shell.upper()}"
+            shooter_name = 'BOT' if shooter[3] else username
+            log_entry = f"[R{rnd}] {shooter_name} -> {'SELF' if target == 'self' else 'OTHER'}: {shell.upper()}"
             log = game_state.get('last_action_log', [])
             log.append(log_entry)
             if len(log) > 20:
@@ -244,6 +288,7 @@ def handler(event: dict, context) -> dict:
             next_turn = current_turn
             game_over = False
             winner_slot = None
+            stayed_turn = False
 
             if target == 'self':
                 if shell == 'live':
@@ -256,16 +301,13 @@ def handler(event: dict, context) -> dict:
                         if len(alive_after) == 1:
                             game_over = True
                             winner_slot = alive_after[0][1]
-                else:
-                    pass
-
-                active_slots = [p[1] for p in active_players if p[5]]
-                idx = active_slots.index(current_turn) if current_turn in active_slots else 0
-                if shell == 'blank' and target == 'self':
-                    pass
-                else:
+                    active_slots = [p[1] for p in active_players if p[5]]
+                    idx = active_slots.index(current_turn) if current_turn in active_slots else 0
                     next_idx = (idx + 1) % len(active_slots) if active_slots else 0
                     next_turn = active_slots[next_idx] if active_slots else 0
+                else:
+                    stayed_turn = True
+                    next_turn = current_turn
             else:
                 if shell == 'live':
                     targets = [p for p in active_players if p[1] != current_turn]
@@ -279,7 +321,6 @@ def handler(event: dict, context) -> dict:
                             if len(alive_remaining) == 1:
                                 game_over = True
                                 winner_slot = alive_remaining[0][1]
-
                 active_slots = [p[1] for p in active_players if p[5]]
                 idx = active_slots.index(current_turn) if current_turn in active_slots else 0
                 next_idx = (idx + 1) % len(active_slots) if active_slots else 0
@@ -319,6 +360,7 @@ def handler(event: dict, context) -> dict:
                 'winner_slot': winner_slot,
                 'shells_remaining': len(shells),
                 'next_turn': next_turn,
+                'stayed_turn': stayed_turn,
                 'log': log
             })}
 

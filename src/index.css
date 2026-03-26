@@ -338,3 +338,55 @@ body::after {
 .shake {
   animation: shake 0.4s ease-out;
 }
+
+/* Shot result animation */
+@keyframes shotResult {
+  0% {
+    transform: scale(0.8) translateY(-6px);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) translateY(0);
+    opacity: 1;
+  }
+}
+
+/* Shot flash full-screen */
+@keyframes shotFlashAnim {
+  0% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* Lobby pulse - players waiting */
+@keyframes lobbyPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Win banner appear */
+@keyframes winBanner {
+  0% {
+    transform: scale(0.7) rotate(-3deg);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.05) rotate(1deg);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+    opacity: 1;
+  }
+}
