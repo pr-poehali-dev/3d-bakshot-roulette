@@ -1,0 +1,13 @@
+{
+  "tests": [
+    {
+      "name": "Game state - no game",
+      "method": "POST",
+      "path": "/",
+      "body": {"action": "state", "game_id": 999999},
+      "expectedStatus": 404,
+      "bodyMatcher": "partial",
+      "expectedBody": {"error": "Игра не найдена"}
+    }
+  ]
+}
